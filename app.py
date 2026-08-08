@@ -3,6 +3,7 @@ import json
 import time
 import ssl
 import io
+import mimetypes
 import urllib3
 import pandas as pd
 import streamlit as st
@@ -34,29 +35,17 @@ EXTRACTION_PROMPT = """
 คุณคือระบบ OCR สำหรับถอดข้อมูลรายการสินค้าจากเอกสารใบเสร็จ/ใบส่งของอย่างแม่นยำ
 
 กฎการดึงข้อมูล:
-1. ดูเฉพาะ "รายการสินค้า" เท่านั้น ข้ามข้อมูลหัวเอกสาร/ท้ายเอกสารทั้งหมด (เช่น ชื่อบริษัท, วันที่, เลขที่เอกสาร, ยอดรวมสุทธิ)
+1. ดูเฉพาะ "รายการสินค้า" เท่านั้น ข้ามข้อมูลหัวเอกสาร/ท้ายเอกสารทั้งหมด
 2. รวมข้อมูลสินค้าที่ข้ามแถว: หากเอกสารแสดงข้อมูลสินค้า 1 รายการแยกหลายแถว ให้จับคู่และรวมเป็นข้อมูล 1 แถวเดียวกัน
-3. หากอ่านตัวอักษร/ตัวเลขบางตัวไม่ชัด ให้ใส่ตัวที่พออ่านได้และเติมเครื่องหมาย '?' กำกับท้าย เช่น 'AB123?', '500?'
-4. ส่งผลลัพธ์กลับมาเป็น JSON Array ของ object เท่านั้น ห้ามมีข้อความอื่น โดยใช้ Key ดังนี้:
+3. หากอ่านตัวอักษร/ตัวเลขบางตัวไม่ชัด ให้ใส่ตัวที่พออ่านได้และเติมเครื่องหมาย '?' กำกับท้าย
+4. ส่งผลลัพธ์กลับมาเป็น JSON Array ของ object เท่านั้น โดยใช้ Key:
    - "product_code": รหัสสินค้า (ถ้าไม่มีใส่ "")
    - "product_name": ชื่อสินค้า
    - "quantity": จำนวน (ถ้าไม่มีใส่ "")
-   - "unit": หน่วย เช่น ชิ้น, กล่อง, ถุง (ถ้าไม่มีใส่ "")
+   - "unit": หน่วย (ถ้าไม่มีใส่ "")
    - "amount": มูลค่า/ราคา (ถ้าไม่มีใส่ "")
-
-ตัวอย่าง JSON:
-[
-  {
-    "product_code": "P001?",
-    "product_name": "สินค้าตัวอย่าง",
-    "quantity": "10",
-    "unit": "ชิ้น",
-    "amount": "1450.00"
-  }
-]
 """
 
-# Header หลักของหน้าเว็บ
 st.title("📦 ระบบถอดข้อมูลและจัดหมวดหมู่สินค้าอัตโนมัติ")
 st.caption("ประมวลผลเอกสารสแกนและจัดกลุ่มสินค้าอัตโนมัติด้วย Gemini AI")
 st.markdown("---")
@@ -64,13 +53,13 @@ st.markdown("---")
 tab1, tab2 = st.tabs(["📄 ขั้นตอนที่ 1: OCR ดึงข้อมูลจากไฟล์สแกน", "🧠 ขั้นตอนที่ 2: AI จับคู่กลุ่มสินค้า"])
 
 # ==========================================
-# TAB 1: OCR (อัปโหลดไฟล์สแกน)
+# TAB 1: OCR (รองรับหลายไฟล์ + ป้องกัน Error)
 # ==========================================
 with tab1:
     st.subheader("1. แนบไฟล์สแกน (JPG, PNG, PDF) เพื่อทำ OCR")
     
     uploaded_scans = st.file_uploader(
-        "อัปโหลดไฟล์สแกน (สามารถลากลงในช่องนี้ หรือกดเลือกหลายไฟล์พร้อมกันได้):",
+        "อัปโหลดไฟล์สแกน (สามารถเลือกหลายไฟล์พร้อมกันได้):",
         type=['jpg', 'jpeg', 'png', 'pdf', 'webp', 'bmp'],
         accept_multiple_files=True
     )
@@ -81,31 +70,74 @@ with tab1:
         else:
             all_folder_items = []
             progress_bar = st.progress(0)
-            status_text = st.empty()
+            status_container = st.container()
 
             for idx, file in enumerate(uploaded_scans):
-                status_text.info(f"⏳ ({idx+1}/{len(uploaded_scans)}) กำลังอ่านไฟล์: `{file.name}`")
+                file_name = file.name
+                
+                # ตรวจสอบ MIME Type ให้ถูกต้อง
+                mime_type = file.type
+                if not mime_type:
+                    mime_type, _ = mimetypes.guess_type(file_name)
+                if not mime_type and file_name.lower().endswith('.pdf'):
+                    mime_type = 'application/pdf'
+
+                with status_container:
+                    st.write(f"⏳ **({idx+1}/{len(uploaded_scans)}) กำลังประมวลผล:** `{file_name}`...")
                 
                 try:
-                    # ส่ง Byte ของไฟล์สแกนให้ Gemini ประมวลผลโดยตรง
+                    file.seek(0)
+                    file_bytes = file.getvalue()
+
                     response = client.models.generate_content(
                         model='gemini-3.5-flash-lite',
                         contents=[
-                            types.Part.from_bytes(data=file.getvalue(), mime_type=file.type),
+                            types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
                             EXTRACTION_PROMPT
                         ],
                         config=types.GenerateContentConfig(response_mime_type="application/json")
                     )
-                    items = json.loads(response.text)
+
+                    # คลีนข้อความก่อนแปลง JSON
+                    raw_text = response.text.strip()
+                    if raw_text.startswith("```json"):
+                        raw_text = raw_text.split("```json")[1].split("```")[0].strip()
+                    elif raw_text.startswith("```"):
+                        raw_text = raw_text.split("```")[1].split("```")[0].strip()
+
+                    parsed_data = json.loads(raw_text)
+
+                    # แปลงโครงสร้างข้อมูลให้เป็น List เสมอ
+                    items = []
+                    if isinstance(parsed_data, list):
+                        items = parsed_data
+                    elif isinstance(parsed_data, dict):
+                        # กรณี AI ส่งกลับมาเป็น {"items": [...]} หรือ Object ตัวเดียว
+                        for v in parsed_data.values():
+                            if isinstance(v, list):
+                                items = v
+                                break
+                        if not items:
+                            items = [parsed_data]
+
+                    # กำหนดชื่อไฟล์ต้นฉบับ
                     for item in items:
-                        item["ไฟล์ต้นฉบับ"] = file.name
-                    all_folder_items.extend(items)
+                        if isinstance(item, dict):
+                            item["ไฟล์ต้นฉบับ"] = file_name
+                            all_folder_items.append(item)
+
+                    with status_container:
+                        st.success(f"✅ `{file_name}`: ถอดข้อมูลได้ {len(items)} รายการ")
+
                 except Exception as e:
-                    st.error(f"❌ เกิดข้อผิดพลาดกับไฟล์ {file.name}: {e}")
+                    with status_container:
+                        st.error(f"❌ เกิดข้อผิดพลาดกับไฟล์ `{file_name}`: {e}")
 
                 progress_bar.progress((idx + 1) / len(uploaded_scans))
+                
+                # หน่วงเวลาเพื่อป้องกัน Rate Limit ของ API
                 if idx < len(uploaded_scans) - 1:
-                    time.sleep(15)
+                    time.sleep(10)
 
             if all_folder_items:
                 df = pd.DataFrame(all_folder_items)
@@ -122,13 +154,10 @@ with tab1:
                 existing_cols = [col for col in target_columns if col in df.columns]
                 df = df[existing_cols]
 
-                status_text.empty()
-                st.success("🎉 ประมวลผล OCR สำเร็จทุกไฟล์!")
-                
-                # แสดงตัวอย่างตารางผลลัพธ์
+                st.markdown("---")
+                st.success(f"🎉 รวมข้อมูลเสร็จสิ้น! พบสินค้าทั้งหมด {len(df)} รายการ จาก {len(uploaded_scans)} ไฟล์")
                 st.dataframe(df, use_container_width=True)
 
-                # สร้างไฟล์ Excel สำหรับดาวน์โหลดในหน่วยความจำ (BytesIO)
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     df.to_excel(writer, index=False)
@@ -139,16 +168,18 @@ with tab1:
                     file_name="สรุปรายการสินค้า.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
+            else:
+                st.error("❌ ไม่สามารถดึงข้อมูลรายการสินค้าจากไฟล์ที่แนบได้เลย")
 
 # ==========================================
-# TAB 2: AI Mapping (แนบไฟล์ Excel 2 ไฟล์)
+# TAB 2: AI Mapping
 # ==========================================
 with tab2:
     st.subheader("2. จับคู่กลุ่มสินค้าด้วย AI")
     
     col1, col2 = st.columns(2)
     with col1:
-        ocr_excel = st.file_uploader("1) แนบไฟล์ Excel ผลลัพธ์ OCR (ที่ดาวน์โหลดจากขั้นตอนที่ 1)", type=['xlsx'])
+        ocr_excel = st.file_uploader("1) แนบไฟล์ Excel ผลลัพธ์ OCR", type=['xlsx'])
     with col2:
         ref_excel = st.file_uploader("2) แนบไฟล์ฐานข้อมูลอ้างอิง (product condition.xlsx)", type=['xlsx'])
 
@@ -173,19 +204,16 @@ with tab2:
                     คุณคือ AI ผู้เชี่ยวชาญด้านวิเคราะห์และจับคู่ข้อมูลสินค้า
                     
                     ไฟล์ที่แนบมาด้วยคือ "ฐานข้อมูลอ้างอิง" (มีคอลัมน์ Product Name และ Item Group)
-                    ฉันมีรายชื่อสินค้าจากระบบ OCR ด้านล่างนี้ ซึ่งอาจพิมพ์ผิด พิมพ์ย่อ หรือชื่อไม่เหมือนในฐานข้อมูลเป๊ะๆ
-                    
                     รายชื่อ OCR ที่ต้องวิเคราะห์:
                     {json.dumps(unique_items, ensure_ascii=False)}
                     
                     งานของคุณ:
-                    ให้ใช้การวิเคราะห์ความหมายและความคล้ายคลึง (Semantic match) เพื่อดูว่าสินค้า OCR แต่ละตัว น่าจะคือสินค้าใดในฐานข้อมูล แล้วดึง 'Item Group' นั้นมาตอบ
-                    หากวิเคราะห์แล้วไม่เข้าข่าย Item Group ใดเลยในไฟล์ ให้ตอบว่า "ไม่พบกลุ่มสินค้า"
+                    ใช้การวิเคราะห์ความหมายเพื่อดูว่าสินค้า OCR แต่ละตัว น่าจะคือสินค้าใดในฐานข้อมูล แล้วดึง 'Item Group' นั้นมาตอบ
+                    หากวิเคราะห์แล้วไม่เข้าข่าย Item Group ใดเลย ให้ตอบว่า "ไม่พบกลุ่มสินค้า"
                     
-                    ส่งผลลัพธ์กลับมาเป็นโครงสร้าง JSON Object อย่างเดียว ห้ามมีข้อความอื่น:
+                    ส่งผลลัพธ์กลับมาเป็นโครงสร้าง JSON Object อย่างเดียว:
                     {{
-                        "ชื่อสินค้าจาก OCR รายการที่ 1": "Item Group ที่วิเคราะห์ได้",
-                        "ชื่อสินค้าจาก OCR รายการที่ 2": "Item Group ที่วิเคราะห์ได้"
+                        "ชื่อสินค้าจาก OCR": "Item Group ที่วิเคราะห์ได้"
                     }}
                     """
 
@@ -210,7 +238,6 @@ with tab2:
                     st.success("✅ AI จับคู่กลุ่มสินค้าเรียบร้อยแล้ว!")
                     st.dataframe(df_ocr, use_container_width=True)
 
-                    # สร้างไฟล์ Excel สำหรับดาวน์โหลด
                     buffer = io.BytesIO()
                     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                         df_ocr.to_excel(writer, index=False)
